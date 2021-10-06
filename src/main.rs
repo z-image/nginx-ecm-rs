@@ -8,6 +8,9 @@ use std::slice;
 
 use structopt::StructOpt;
 
+#[macro_use]
+extern crate lazy_static;
+
 const NGX_FC_HEADER_VERSION: ngx_uint_t = 5;
 
 
@@ -53,7 +56,9 @@ fn nginx_file_cache_read(file: &Path) {
             file.to_str().unwrap(), NGX_FC_HEADER_VERSION, chd.version);
     }
 
-    // println!("{} {} {} {}", file.to_str().unwrap(), chd.valid_sec, chd.updating_sec, chd.error_sec);
+    if OPT.debug {
+        println!("{} {} {} {}", file.to_str().unwrap(), chd.valid_sec, chd.updating_sec, chd.error_sec);
+    }
 }
 
 
@@ -77,12 +82,17 @@ fn path_walk(dir: &Path) {
 #[derive(StructOpt, Debug)]
 struct Opt {
     cache_dir: String,
+    /// Activate debug mode
+    #[structopt(short = "d", long = "debug")]
+    debug: bool,
 }
 
+lazy_static! {
+    static ref OPT: Opt = Opt::from_args();
+}
 
 pub fn main() {
-    let opt = Opt::from_args();
-
-    let path = Path::new(&opt.cache_dir);
+    let path = Path::new(&OPT.cache_dir);
     path_walk(path);
 }
+
