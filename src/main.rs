@@ -1,12 +1,12 @@
 #![allow(non_camel_case_types)]
 
-use std::env;
 use std::fs;
 use std::io::prelude::*;
 use std::mem;
 use std::path::Path;
-use std::process;
 use std::slice;
+
+use structopt::StructOpt;
 
 const NGX_FC_HEADER_VERSION: ngx_uint_t = 5;
 
@@ -74,20 +74,15 @@ fn path_walk(dir: &Path) {
 }
 
 
+#[derive(StructOpt, Debug)]
+struct Opt {
+    cache_dir: String,
+}
+
+
 pub fn main() {
-    let mut args: Vec<String> = env::args().collect();
+    let opt = Opt::from_args();
 
-    if args.len() < 2 {
-        eprintln!("Usage: {} <cache_dir>", args[0]);
-        process::exit(1);
-    }
-
-    let cache_dir = args.remove(1);
-
-    if cache_dir.is_empty() {
-        process::exit(1);
-    }
-
-    let path = Path::new(&cache_dir);
+    let path = Path::new(&opt.cache_dir);
     path_walk(path);
 }
