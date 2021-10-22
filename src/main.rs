@@ -402,6 +402,7 @@ pub fn main() {
 mod tests {
 	use super::*;
 	use proptest::prelude::*;
+	use std::process::Command;
 
 	#[test]
 	fn test_calc_cache_status() {
@@ -424,8 +425,19 @@ mod tests {
 
 	#[test]
 	fn test_humanize_time() {
+		let mut cmd = Command::new("date");
+		let output = cmd
+			.arg("--date")
+			.arg("@60")
+			.arg("+%Y-%m-%dT%H:%M:%S")
+			.output()
+			.unwrap()
+			.stdout;
+		let output = String::from_utf8(output).unwrap();
+		let local_minute_after_uts0 = output.trim_end();
+
 		assert_eq!(humanize_time(100, false), "100");
-		assert_eq!(humanize_time(100, true), "1970-01-01T02:01:40");
+		assert_eq!(humanize_time(60, true), local_minute_after_uts0);
 		assert_eq!(humanize_time(0, false), "0");
 		assert_eq!(humanize_time(0, true), "0");
 	}

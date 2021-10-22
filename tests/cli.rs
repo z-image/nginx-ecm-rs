@@ -39,6 +39,11 @@ struct ngx_http_file_cache_header_t {
 
 const CLI_NAME: &str = "nginx-ecm-rs";
 
+#[link(name = "c")]
+extern "C" {
+	fn geteuid() -> u32;
+}
+
 fn create_cache_file(
 	tmp_dir: &std::path::Path,
 	version: usize,
@@ -98,19 +103,26 @@ fn cache_dir_doesnt_exist() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn cache_dir_no_permission() -> Result<(), Box<dyn std::error::Error>> {
-	let dir = tempfile::tempdir().unwrap();
-	let path = dir.path();
+	let euid = unsafe { geteuid() };
 
-	let metadata = path.metadata()?;
-	let mut permissions = metadata.permissions();
-	permissions.set_mode(0o000);
-	fs::set_permissions(path, permissions)?;
+	// skip test if root
+	if euid == 0 {
+		assert!(true, "SKIP")
+	} else {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path();
 
-	let mut cmd = Command::cargo_bin("nginx-ecm-rs")?;
-	cmd.arg(path);
-	cmd.assert()
-		.failure()
-		.stderr(predicate::str::contains("Permission denied"));
+		let metadata = path.metadata()?;
+		let mut permissions = metadata.permissions();
+		permissions.set_mode(0o000);
+		fs::set_permissions(path, permissions)?;
+
+		let mut cmd = Command::cargo_bin("nginx-ecm-rs")?;
+		cmd.arg(path);
+		cmd.assert()
+			.failure()
+			.stderr(predicate::str::contains("Permission denied"));
+	}
 
 	Ok(())
 }
@@ -132,22 +144,29 @@ fn special_file() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn cache_file_no_permission() -> Result<(), Box<dyn std::error::Error>> {
-	let dir = tempfile::tempdir().unwrap();
-	let path = dir.path();
+	let euid = unsafe { geteuid() };
 
-	let file_path = dir.path().join("cache-test.bin");
-	fs::File::create(&file_path)?;
+	// skip test if root
+	if euid == 0 {
+		assert!(true, "SKIP")
+	} else {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path();
 
-	let metadata = file_path.metadata()?;
-	let mut permissions = metadata.permissions();
-	permissions.set_mode(0o000);
-	fs::set_permissions(file_path, permissions)?;
+		let file_path = dir.path().join("cache-test.bin");
+		fs::File::create(&file_path)?;
 
-	let mut cmd = Command::cargo_bin("nginx-ecm-rs")?;
-	cmd.arg(path);
-	cmd.assert()
-		.failure()
-		.stderr(predicate::str::contains("Permission denied"));
+		let metadata = file_path.metadata()?;
+		let mut permissions = metadata.permissions();
+		permissions.set_mode(0o000);
+		fs::set_permissions(file_path, permissions)?;
+
+		let mut cmd = Command::cargo_bin("nginx-ecm-rs")?;
+		cmd.arg(path);
+		cmd.assert()
+			.failure()
+			.stderr(predicate::str::contains("Permission denied"));
+	}
 
 	Ok(())
 }
