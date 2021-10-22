@@ -135,7 +135,7 @@ fn cache_meta_print(cache_meta: &CacheMeta, status: &CacheStatus) {
 
 	let mut header = format!(
 		"{:55}  {:>19}  {:>19}  {:>19}  {:>7}",
-		"path", "expires", "if-updating", "if-error", "status"
+		"path", "expires", "while-revalidate", "if-error", "status"
 	);
 	if key.is_some() {
 		header = format!("{} {}", header, "key");
