@@ -2,6 +2,8 @@
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
 
+// TODO: change i64 to libc::time_t?
+
 use std::convert::TryFrom;
 use std::error;
 use std::fmt;
@@ -60,11 +62,13 @@ struct ngx_http_file_cache_header_t {
 	variant: [u_char; 16_usize],
 }
 
-struct CacheMeta {
+struct NginxFileCacheInfo {
 	path: String,
 	cache_header: ngx_http_file_cache_header_t,
 	key: Option<String>,
 }
+
+// TODO: impl NginxFileCache, fn cache_status()?
 
 #[derive(PartialEq, Debug)]
 enum CacheStatus {
@@ -72,6 +76,20 @@ enum CacheStatus {
 	Updating,
 	Stale,
 	Expired,
+}
+
+// unix timestamps
+#[derive(Debug)]
+struct TimeRange {
+	after: Option<i64>,
+	before: Option<i64>,
+}
+
+impl NginxFileCacheInfo {
+	fn max_valid(&self) -> i64 {
+		(self.cache_header.valid_sec + self.cache_header.updating_sec)
+			.max(self.cache_header.valid_sec + self.cache_header.error_sec)
+	}
 }
 
 impl fmt::Display for CacheStatus {
@@ -116,10 +134,10 @@ fn humanize_time(uts: i64, human: bool) -> String {
 	}
 }
 
-fn cache_meta_print(cache_meta: &CacheMeta, status: &CacheStatus) {
-	let path = &cache_meta.path;
-	let cache_header = &cache_meta.cache_header;
-	let key = &cache_meta.key;
+fn nginx_cache_print(nginx_cache: &NginxFileCacheInfo, status: &CacheStatus) {
+	let path = &nginx_cache.path;
+	let cache_header = &nginx_cache.cache_header;
+	let key = &nginx_cache.key;
 
 	let valid = humanize_time(cache_header.valid_sec, OPT.human_time);
 	let updating = if cache_header.updating_sec > 0 {
@@ -164,29 +182,27 @@ fn cache_meta_print(cache_meta: &CacheMeta, status: &CacheStatus) {
 	}
 }
 
-fn is_match(cache_meta: &CacheMeta, time_range: (Option<i64>, Option<i64>), key_re: Option<&String>) -> bool {
-	let (after_ts, before_ts) = time_range;
+fn is_match(expiration_ts: i64, time_range: &TimeRange, key: Option<&String>, key_pat: Option<&String>) -> bool {
+	eprintln!(
+		"D: is_match({}, {:?}, {:?}, {:?})",
+		expiration_ts, time_range, key, key_pat
+	);
 
-	let cache_header = &cache_meta.cache_header;
-
-	let max_valid =
-		(cache_header.valid_sec + cache_header.updating_sec).max(cache_header.valid_sec + cache_header.error_sec);
-
-	if let Some(before_ts) = before_ts {
-		if max_valid > before_ts {
+	if let Some(before_ts) = time_range.before {
+		if expiration_ts > before_ts {
 			return false;
 		}
 	}
 
-	if let Some(after_ts) = after_ts {
-		if max_valid < after_ts {
+	if let Some(after_ts) = time_range.after {
+		if expiration_ts < after_ts {
 			return false;
 		}
 	}
 
-	if let Some(key_re) = key_re {
-		if let Some(key) = &cache_meta.key {
-			if !key.contains(key_re) {
+	if let Some(pat) = key_pat {
+		if let Some(key) = key {
+			if !key.contains(pat) {
 				return false;
 			}
 		}
@@ -195,7 +211,7 @@ fn is_match(cache_meta: &CacheMeta, time_range: (Option<i64>, Option<i64>), key_
 	true
 }
 
-fn nginx_file_cache_read(path: &Path, read_key: bool) -> Result<CacheMeta, Box<dyn error::Error>> {
+fn nginx_file_cache_read(path: &Path, read_key: bool) -> Result<NginxFileCacheInfo, Box<dyn error::Error>> {
 	let display = path.display();
 	let mut cache_header: ngx_http_file_cache_header_t = unsafe { mem::zeroed() };
 	let cache_header_size = mem::size_of::<ngx_http_file_cache_header_t>();
@@ -247,7 +263,7 @@ fn nginx_file_cache_read(path: &Path, read_key: bool) -> Result<CacheMeta, Box<d
 		eprintln!("D: path {}, key {:?}", display, key);
 	}
 
-	Ok(CacheMeta {
+	Ok(NginxFileCacheInfo {
 		path: path.to_str().unwrap().to_string(),
 		cache_header,
 		key,
@@ -266,7 +282,7 @@ fn purge(path: &Path) {
 	}
 }
 
-fn path_walk(dir: &Path, time_range: (Option<i64>, Option<i64>)) {
+fn path_walk(dir: &Path, time_range: &TimeRange) {
 	let rd_itr = match dir.read_dir() {
 		Ok(rd_itr) => rd_itr,
 		Err(e) => panic!("{} {:?}", dir.display(), e),
@@ -279,15 +295,20 @@ fn path_walk(dir: &Path, time_range: (Option<i64>, Option<i64>)) {
 		if file_type.is_dir() {
 			path_walk(&path, time_range);
 		} else if file_type.is_file() {
-			let cache_meta = match nginx_file_cache_read(&path, OPT.match_key.is_some()) {
-				Ok(cm) => cm,
+			let nginx_cache = match nginx_file_cache_read(&path, OPT.match_key.is_some()) {
+				Ok(nc) => nc,
 				Err(e) => {
 					eprintln!("nginx_file_cache_read({}) error: {:?}", path.display(), e);
 					continue;
 				}
 			};
 
-			if !is_match(&cache_meta, time_range, OPT.match_key.as_ref()) {
+			if !is_match(
+				nginx_cache.max_valid(),
+				time_range,
+				nginx_cache.key.as_ref(),
+				OPT.match_key.as_ref(),
+			) {
 				continue;
 			}
 
@@ -299,11 +320,11 @@ fn path_walk(dir: &Path, time_range: (Option<i64>, Option<i64>)) {
 				let uts = i64::try_from(uts).expect("SystemTime::now() u64 -> i64 overflow?");
 				let status = calc_cache_status(
 					uts,
-					cache_meta.cache_header.valid_sec,
-					cache_meta.cache_header.updating_sec,
-					cache_meta.cache_header.error_sec,
+					nginx_cache.cache_header.valid_sec,
+					nginx_cache.cache_header.updating_sec,
+					nginx_cache.cache_header.error_sec,
 				);
-				cache_meta_print(&cache_meta, &status);
+				nginx_cache_print(&nginx_cache, &status);
 			}
 
 			if OPT.purge {
@@ -380,7 +401,10 @@ pub fn main() {
 		exp_bef_ts = Option::Some(exp_b_dt.timestamp());
 	}
 
-	let time_range = (exp_aft_ts, exp_bef_ts);
+	let time_range = TimeRange {
+		after: exp_aft_ts,
+		before: exp_bef_ts,
+	};
 	let path = Path::new(&OPT.cache_dir);
 
 	if OPT.debug && OPT.match_key.is_some() {
@@ -395,7 +419,7 @@ pub fn main() {
 		}
 	}
 
-	path_walk(path, time_range);
+	path_walk(path, &time_range);
 }
 
 #[cfg(test)]
@@ -443,119 +467,167 @@ mod tests {
 	}
 
 	#[test]
-	fn test_is_match() {
+	fn test_max_valid_is_match() {
 		let cache_header: ngx_http_file_cache_header_t = unsafe { mem::zeroed() };
 		let path = "/var/nginx/cache/a/b/deadbeef".to_string();
 		let key = Option::None;
-		let mut cm = CacheMeta {
+		let mut nginx_cache = NginxFileCacheInfo {
 			path,
 			cache_header,
 			key,
 		};
 
 		// valid_sec alone
-		cm.cache_header.valid_sec = 150;
+		let time_range = TimeRange {
+			after: Some(100),
+			before: Some(200),
+		};
+
+		nginx_cache.cache_header.valid_sec = 150;
 		assert!(
-			is_match(&cm, (Some(100), Some(200)), Option::None),
+			is_match(
+				nginx_cache.max_valid(),
+				&time_range,
+				nginx_cache.key.as_ref(),
+				Option::None
+			),
 			"expiration is within filter limits"
 		);
 
-		cm.cache_header.valid_sec = 100;
+		nginx_cache.cache_header.valid_sec = 100;
 		assert!(
-			is_match(&cm, (Some(100), Some(200)), Option::None),
+			is_match(
+				nginx_cache.max_valid(),
+				&time_range,
+				nginx_cache.key.as_ref(),
+				Option::None
+			),
 			"expiration is within filter limits (= after)"
 		);
 
-		cm.cache_header.valid_sec = 200;
+		nginx_cache.cache_header.valid_sec = 200;
 		assert!(
-			is_match(&cm, (Some(100), Some(200)), Option::None),
+			is_match(
+				nginx_cache.max_valid(),
+				&time_range,
+				nginx_cache.key.as_ref(),
+				Option::None
+			),
 			"expiration is within filter limits (= before)"
 		);
 
-		cm.cache_header.valid_sec = 50;
+		nginx_cache.cache_header.valid_sec = 50;
 		assert!(
-			!is_match(&cm, (Some(100), Some(200)), Option::None),
+			!is_match(
+				nginx_cache.max_valid(),
+				&time_range,
+				nginx_cache.key.as_ref(),
+				Option::None
+			),
 			"expiration is outside filter limits (< after)"
 		);
 
-		cm.cache_header.valid_sec = 250;
+		nginx_cache.cache_header.valid_sec = 250;
 		assert!(
-			!is_match(&cm, (Some(100), Some(200)), Option::None),
+			!is_match(
+				nginx_cache.max_valid(),
+				&time_range,
+				nginx_cache.key.as_ref(),
+				Option::None
+			),
 			"expiration outside filter limits (> before)"
 		);
 
-		cm.cache_header.valid_sec = 50;
-
-		cm.cache_header.updating_sec = 50;
+		// stale-while-revalidate
+		nginx_cache.cache_header.valid_sec = 50;
+		nginx_cache.cache_header.updating_sec = 50;
 		assert!(
-			is_match(&cm, (Some(100), Some(200)), Option::None),
+			is_match(
+				nginx_cache.max_valid(),
+				&time_range,
+				nginx_cache.key.as_ref(),
+				Option::None
+			),
 			"expiration/updating is within filter limits (=after, <before)"
 		);
-		cm.cache_header.updating_sec = 49;
+
+		nginx_cache.cache_header.valid_sec = 50;
+		nginx_cache.cache_header.updating_sec = 49;
 		assert!(
-			!is_match(&cm, (Some(100), Some(200)), Option::None),
+			!is_match(
+				nginx_cache.max_valid(),
+				&time_range,
+				nginx_cache.key.as_ref(),
+				Option::None
+			),
 			"expiration/updating is outside filter limits (<after)"
 		);
 
-		cm.cache_header.updating_sec = 0;
-
-		cm.cache_header.error_sec = 150;
+		// stale-if-error
+		nginx_cache.cache_header.valid_sec = 50;
+		nginx_cache.cache_header.error_sec = 150;
 		assert!(
-			is_match(&cm, (Some(100), Some(200)), Option::None),
+			is_match(
+				nginx_cache.max_valid(),
+				&time_range,
+				nginx_cache.key.as_ref(),
+				Option::None
+			),
 			"expiration/error is within filter limits (>after, =before)"
 		);
-		cm.cache_header.error_sec = 151;
+
+		nginx_cache.cache_header.valid_sec = 50;
+		nginx_cache.cache_header.error_sec = 151;
 		assert!(
-			!is_match(&cm, (Some(100), Some(200)), Option::None),
+			!is_match(
+				nginx_cache.max_valid(),
+				&time_range,
+				nginx_cache.key.as_ref(),
+				Option::None
+			),
 			"expiration/error is outside filter limits (>after, >before)"
 		);
 
-		// fix valid_sec for key match tests
-		cm.cache_header.valid_sec = 150;
-		cm.cache_header.updating_sec = 0;
-		cm.cache_header.error_sec = 0;
+		// fix validity for key match tests
+		nginx_cache.cache_header.valid_sec = 150;
+		nginx_cache.cache_header.updating_sec = 0;
+		nginx_cache.cache_header.error_sec = 0;
 
-		cm.key = Some("http://example.com/white".to_string());
+		nginx_cache.key = Some("http://example.com/white".to_string());
 		assert!(
-			is_match(&cm, (Some(100), Some(200)), Some(&"white".to_string())),
+			is_match(
+				nginx_cache.max_valid(),
+				&time_range,
+				nginx_cache.key.as_ref(),
+				Some(&"white".to_string())
+			),
 			"key matches"
 		);
 		assert!(
-			!is_match(&cm, (Some(100), Some(200)), Some(&"black".to_string())),
+			!is_match(
+				nginx_cache.max_valid(),
+				&time_range,
+				nginx_cache.key.as_ref(),
+				Some(&"black".to_string())
+			),
 			"key doesn't match"
 		);
 	}
 
 	proptest! {
-		#[test]
 		fn match_any_printable_key_string(s in ".*") {
-			let cache_header: ngx_http_file_cache_header_t = unsafe { mem::zeroed() };
+			let mut cache_header: ngx_http_file_cache_header_t = unsafe { mem::zeroed() };
 			let path = "/var/nginx/cache/a/b/deadbeef".to_string();
 			let key = Some(s.clone());
-			let mut cm = CacheMeta {path, cache_header, key};
+			cache_header.valid_sec = 150;
+			cache_header.valid_sec = 0;
+			cache_header.valid_sec = 0;
 
-			cm.cache_header.valid_sec = 150;
-			cm.cache_header.updating_sec = 0;
-			cm.cache_header.error_sec = 0;
+			let nginx_cache = NginxFileCacheInfo {path, cache_header, key};
 
-			prop_assert_eq!(true, is_match(&cm, (Some(100), Some(200)), Some(&s)), "random data");
-		}
+			let time_range = TimeRange { after: Some(100), before: Some(200) };
 
-		#[test]
-		fn match_corrupted_data_no_crash(s in ".{336}") {
-			let path = "/var/nginx/cache/a/b/deadbeef".to_string();
-
-			let mut cache_header: ngx_http_file_cache_header_t = unsafe { mem::zeroed() };
-			let cache_header_size = mem::size_of::<ngx_http_file_cache_header_t>();
-			let cache_header_slice = unsafe { slice::from_raw_parts_mut(&mut cache_header as *mut _ as *mut u8, cache_header_size) };
-
-			cache_header_slice.copy_from_slice(&s.as_bytes()[1..=336]);
-
-			let key = Some(s);
-
-			let cm = CacheMeta {path, cache_header, key};
-
-			prop_assert_eq!(false, is_match(&cm, (Some(100), Some(200)), Some(&"x".to_string())), "random data");
+			prop_assert!(is_match(nginx_cache.max_valid(), &time_range, nginx_cache.key.as_ref(), nginx_cache.key.as_ref()), "random data");
 		}
 	}
 }
